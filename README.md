@@ -57,6 +57,28 @@ Keys
 Click [x] to close, drag the title to move, drag the bottom right corner to
 resize, click the shell to type in it. Exit the shell and you get a new one.
 
+fbttywm
+-------
+![fbttywm](fbttywm.png)
+
+ttywm without X. It draws straight on the framebuffer in the console's own
+font, reads the keyboard and mouse itself, and every window is one of its own
+terminals. One C file, no libraries.
+
+	make fbttywm
+	sudo make install-fb
+
+or on Chamesle Linux:
+
+	sudo apk add fbttywm
+
+Log in on a text console and run fbttywm. Your user needs to be in the video
+and input groups. Same keys as ttywm, minus the apps menu and volume.
+Super+Shift+e quits.
+
+It's also what Chamesle Source ships as its desktop, as source you have to
+compile yourself: https://github.com/tortr-rs/chamesle-source
+
 ## cheers @tortr-rs
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/L6N725GI1V)

@@ -9,6 +9,7 @@
  * super+1..9   tty1 to tty9        super+shift+1..9  send the window there
  * super+shift+e  quit
  * drag a title, or super+left drag to move. super+right drag to resize. click [x] to close */
+#define _XOPEN_SOURCE 700
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -1060,8 +1061,10 @@ main(void)
 	sh = getenv("SHELL");
 	if (!sh || access(sh, X_OK))
 		sh = access("/sh", X_OK) == 0 ? "/sh" : "/bin/sh";
-	if ((tty = open("/dev/tty0", O_RDWR)) < 0)
-		tty = 0;
+	/* the console it's started from: that one is yours. /dev/tty0 is root's */
+	tty = 0;
+	if (ioctl(tty, KDGETMODE, &i) < 0 && (tty = open("/dev/tty0", O_RDWR)) < 0)
+		die("not on a console");
 	getfont();
 	openfb();
 	opendevs();

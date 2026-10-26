@@ -23,7 +23,18 @@ uninstall:
 	rm -rf $(DESTDIR)$(PREFIX)/bin/ttywm $(DESTDIR)$(PREFIX)/bin/ttywm-term $(DESTDIR)$(PREFIX)/bin/ttywm-session $(DESTDIR)/usr/share/fonts/ttywm \
 	      $(DESTDIR)/usr/share/xsessions/ttywm.desktop
 
-clean:
-	rm -f ttywm
+# fbttywm: the same on the framebuffer, without X. needs nothing but a libc
+fbttywm: fbttywm.c
+	$(CC) -O2 -Wall -o $@ fbttywm.c
 
-.PHONY: install uninstall clean
+install-fb: fbttywm
+	mkdir -p $(DESTDIR)$(PREFIX)/bin
+	install -m 755 fbttywm $(DESTDIR)$(PREFIX)/bin/
+
+uninstall-fb:
+	rm -f $(DESTDIR)$(PREFIX)/bin/fbttywm
+
+clean:
+	rm -f ttywm fbttywm
+
+.PHONY: install uninstall install-fb uninstall-fb clean
