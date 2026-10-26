@@ -1,5 +1,8 @@
 ttywm - a window manager that looks like a tty
 ==============================================
+
+![ttywm](screenshot.png)
+
 Every screen is a full screen shell, in the console's own font and colours.
 Windows float on top of it in frames drawn with that font:
 
@@ -17,6 +20,10 @@ Install
 -------
 	make
 	sudo make install
+
+or on Chamesle Linux:
+
+	sudo apk add ttywm
 
 then pick ttywm on your login screen, or put this in ~/.xinitrc and run startx:
 
@@ -49,3 +56,7 @@ Keys
 
 Click [x] to close, drag the title to move, drag the bottom right corner to
 resize, click the shell to type in it. Exit the shell and you get a new one.
+
+## cheers @tortr-rs
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/L6N725GI1V)
