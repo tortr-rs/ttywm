@@ -12,6 +12,8 @@
 #include <unistd.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <dbus/dbus.h>
+#include <security/pam_appl.h>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -28,8 +30,9 @@
 #define SHELLCMD        "ttywm-term"
 
 enum { ColBg, ColWindow, ColOther, ColTitle, ColBar, ColLast };
-enum { ActRun, ActTerminal, ActMenu, ActClose, ActNext, ActFull, ActQuit, ActView, ActSend, ActVolUp, ActVolDown, ActMute };
-enum { SegNone, SegNet, SegVol };
+enum { ActRun, ActTerminal, ActMenu, ActClose, ActNext, ActFull, ActQuit, ActView, ActSend, ActVolUp, ActVolDown, ActMute,
+       ActLightUp, ActLightDown, ActLeft, ActRight, ActMax, ActRestore, ActLock };
+enum { SegNone, SegNet, SegVol, SegLight };
 
 typedef struct {
 	unsigned int mod;
@@ -38,11 +41,23 @@ typedef struct {
 	char *cmd;
 } Key;
 
+typedef struct Notif Notif;
+struct Notif {
+	unsigned int id;
+	char app[64], line[4][128];
+	int nlines, w, h;
+	time_t until;
+	Window win;
+	XftDraw *draw;
+	Notif *next;
+};
+
 typedef struct Client Client;
 struct Client {
 	char name[256];
 	int x, y, w, h, oldx, oldy, oldw, oldh;
 	int scr, isfull, ignoreunmap;
+	int snapped, sx, sy, sw, sh;	/* where it was before super+arrows */
 	Window win, frame;
 	XftDraw *draw;
 	Client *next;
@@ -51,7 +66,7 @@ struct Client {
 /* settings, from ~/.config/ttywm/config */
 static char terminal[256] = "ttywm-term", menu[256] = "rofi -show drun";
 static char colname[ColLast][32] = { "black", "white", "grey", "white", "grey" };
-static int clock24 = 1, showclock = 1, showdate = 1, showbattery = 1, shownetwork = 1, showvolume = 1, big;
+static int clock24 = 1, showclock = 1, showdate = 1, showbattery = 1, shownetwork = 1, showvolume = 1, showlight = 1, big;
 static Key *keys;
 static int nkeys;
 
@@ -72,6 +87,7 @@ static const char defaultconfig[] =
 "# what's on the bottom line. on or off\n"
 "network = on\n"
 "volume = on\n"
+"brightness = on\n"
 "battery = on\n"
 "date = on\n"
 "# 24 hour, 12 hour or off\n"
@@ -91,6 +107,8 @@ static const char defaultconfig[] =
 "super+f = full screen\n"
 "super+shift+e = log out\n"
 "# super+1 to super+9 go to tty1 to tty9, super+shift+1 to 9 send a window there\n"
+"# super+left and super+right put a window on half the screen, super+up fills it,\n"
+"# super+down puts it back. super+l locks the screen\n"
 "\n"
 "# programs to start when you log in, one per line, like:\n"
 "# start = firefox\n";
@@ -108,6 +126,11 @@ static Atom wmprotocols, wmdelete, wmstate, netwmname, netwmstate, netfullscreen
 static char cfgpath[4096];
 static time_t cfgmtime;
 static int vol = -1, muted;
+static void (*handler[LASTEvent])(XEvent *);
+static char backlight[256];	/* /sys/class/backlight/..., or empty */
+static DBusConnection *bus;
+static Notif *notifs;
+static unsigned int lastid;
 static struct { int x0, x1, seg; } segs[8];
 static int nsegs;
 
@@ -317,7 +340,8 @@ parsekey(char *name, char *value)
 	static const struct { const char *word; int act; } acts[] = {
 		{ "terminal", ActTerminal }, { "appsmenu", ActMenu }, { "menu", ActMenu },
 		{ "closewindow", ActClose }, { "close", ActClose }, { "nextwindow", ActNext },
-		{ "fullscreen", ActFull }, { "logout", ActQuit }, { "quit", ActQuit },
+		{ "fullscreen", ActFull }, { "logout", ActQuit }, { "quit", ActQuit }, { "lock", ActLock },
+		{ "lockscreen", ActLock },
 	};
 	unsigned int mod = 0, i;
 	char *tok, *last = NULL, act[64];
@@ -406,6 +430,8 @@ loadconfig(int firsttime)
 			shownetwork = yes(value);
 		else if (!strcmp(key, "volume"))
 			showvolume = yes(value);
+		else if (!strcmp(key, "brightness"))
+			showlight = yes(value);
 		else if (!strcmp(key, "battery"))
 			showbattery = yes(value);
 		else if (!strcmp(key, "date"))
@@ -435,6 +461,13 @@ loadconfig(int firsttime)
 	addkey(0, XStringToKeysym("XF86AudioRaiseVolume"), ActVolUp, 0, NULL);
 	addkey(0, XStringToKeysym("XF86AudioLowerVolume"), ActVolDown, 0, NULL);
 	addkey(0, XStringToKeysym("XF86AudioMute"), ActMute, 0, NULL);
+	addkey(0, XStringToKeysym("XF86MonBrightnessUp"), ActLightUp, 0, NULL);
+	addkey(0, XStringToKeysym("XF86MonBrightnessDown"), ActLightDown, 0, NULL);
+	addkey(Mod4Mask, XK_Left, ActLeft, 0, NULL);
+	addkey(Mod4Mask, XK_Right, ActRight, 0, NULL);
+	addkey(Mod4Mask, XK_Up, ActMax, 0, NULL);
+	addkey(Mod4Mask, XK_Down, ActRestore, 0, NULL);
+	addkey(Mod4Mask, XK_l, ActLock, 0, NULL);
 }
 
 static void
@@ -550,6 +583,54 @@ readvolume(void)
 	}
 }
 
+/* the first backlight there is. the video group may write it */
+static void
+findbacklight(void)
+{
+	DIR *d;
+	struct dirent *e;
+
+	backlight[0] = '\0';
+	if (!(d = opendir("/sys/class/backlight")))
+		return;
+	while ((e = readdir(d)))
+		if (e->d_name[0] != '.') {
+			snprintf(backlight, sizeof backlight, "/sys/class/backlight/%s", e->d_name);
+			break;
+		}
+	closedir(d);
+}
+
+static int
+light(void)
+{
+	long now, max;
+
+	if (!backlight[0] || (now = readnum(backlight, "brightness")) < 0 || (max = readnum(backlight, "max_brightness")) <= 0)
+		return -1;
+	return (now * 100 + max / 2) / max;
+}
+
+static void
+setlight(int step)
+{
+	char path[300];
+	long max;
+	int pct = light();
+	FILE *f;
+
+	if (pct < 0 || (max = readnum(backlight, "max_brightness")) <= 0)
+		return;
+	/* 5% steps, but never all the way to black */
+	pct = MIN(MAX(pct + step, 1), 100);
+	snprintf(path, sizeof path, "%s/brightness", backlight);
+	if ((f = fopen(path, "w"))) {
+		fprintf(f, "%ld\n", MAX(pct * max / 100, 1));
+		fclose(f);
+	} else
+		fprintf(stderr, "ttywm: %s: can't write it, are you in the video group?\n", path);
+}
+
 static void
 network(char *s, size_t n)
 {
@@ -628,6 +709,10 @@ drawbar(void)
 		snprintf(seg[n], sizeof seg[n], muted ? "vol muted" : "vol %d%%", vol);
 		kind[n++] = SegVol;
 	}
+	if (showlight && light() >= 0) {
+		snprintf(seg[n], sizeof seg[n], "light %d%%", light());
+		kind[n++] = SegLight;
+	}
 	if (showbattery && battery(seg[n], sizeof seg[n]))
 		kind[n++] = SegNone;
 	if (showdate) {
@@ -667,6 +752,293 @@ setvolume(const char *how)
 	runwait(cmd, NULL, 0);
 	readvolume();
 	drawbar();
+}
+
+/* ---- notifications: ttywm is org.freedesktop.Notifications ---- */
+
+#define NOTIFCOLS 48
+
+/* characters, not bytes */
+static int
+ulen(const char *s)
+{
+	int n = 0;
+
+	for (; *s; s++)
+		n += (*s & 0xc0) != 0x80;
+	return n;
+}
+
+/* the first n characters of s */
+static void
+ucut(char *dst, const char *s, int n, size_t size)
+{
+	size_t i = 0;
+
+	for (; *s && i < size - 1; s++) {
+		if ((*s & 0xc0) != 0x80 && n-- <= 0)
+			break;
+		dst[i++] = *s;
+	}
+	dst[i] = '\0';
+}
+
+/* <b>bold</b> &amp; co. as plain text */
+static void
+plain(char *dst, const char *s, size_t size)
+{
+	static const char *ent[][2] = { { "&amp;", "&" }, { "&lt;", "<" }, { "&gt;", ">" }, { "&quot;", "\"" }, { "&apos;", "'" } };
+	size_t i = 0;
+	unsigned int e;
+
+	while (*s && i < size - 1) {
+		if (*s == '<' && strchr(s, '>')) {
+			s = strchr(s, '>') + 1;
+			continue;
+		}
+		for (e = 0; e < LENGTH(ent); e++)
+			if (!strncmp(s, ent[e][0], strlen(ent[e][0])))
+				break;
+		if (e < LENGTH(ent)) {
+			dst[i++] = ent[e][1][0];
+			s += strlen(ent[e][0]);
+		} else
+			dst[i++] = *s == '\n' || *s == '\t' ? ' ' : *s, s++;
+	}
+	dst[i] = '\0';
+}
+
+static void
+drawnotif(Notif *n)
+{
+	char buf[1024], *p;
+	int cols = n->w / cw, i;
+
+	XftDrawRect(n->draw, &col[ColBg], 0, 0, n->w, n->h);
+	text(n->draw, ColWindow, 0, 0, "┌─[");
+	snprintf(buf, sizeof buf, " %s ", n->app);
+	text(n->draw, ColTitle, 3 * cw, 0, buf);
+	p = buf + sprintf(buf, "]");
+	for (i = ulen(n->app) + 6; i < cols - 1; i++)
+		p += sprintf(p, "─");
+	sprintf(p, "┐");
+	text(n->draw, ColWindow, (ulen(n->app) + 5) * cw, 0, buf);
+	for (i = 0; i < n->nlines; i++) {
+		text(n->draw, ColWindow, 0, (i + 1) * ch, "│");
+		text(n->draw, i ? ColWindow : ColTitle, 2 * cw, (i + 1) * ch, n->line[i]);
+		text(n->draw, ColWindow, (cols - 1) * cw, (i + 1) * ch, "│");
+	}
+	p = buf + sprintf(buf, "└");
+	for (i = 2; i < cols; i++)
+		p += sprintf(p, "─");
+	sprintf(p, "┘");
+	text(n->draw, ColWindow, 0, (n->nlines + 1) * ch, buf);
+}
+
+/* stacked down from the top right corner, newest last */
+static void
+placenotifs(void)
+{
+	Notif *n;
+	int y = 0;
+
+	for (n = notifs; n; n = n->next) {
+		XMoveResizeWindow(dpy, n->win, sw / cw * cw - n->w, y, n->w, n->h);
+		XRaiseWindow(dpy, n->win);
+		drawnotif(n);
+		y += n->h;
+	}
+}
+
+static void
+closenotif(Notif *n, unsigned int why)
+{
+	Notif **pn;
+	DBusMessage *m;
+	dbus_uint32_t id = n->id, reason = why;
+
+	for (pn = &notifs; *pn != n; pn = &(*pn)->next);
+	*pn = n->next;
+	XftDrawDestroy(n->draw);
+	XDestroyWindow(dpy, n->win);
+	free(n);
+	placenotifs();
+	if (bus && (m = dbus_message_new_signal("/org/freedesktop/Notifications",
+	    "org.freedesktop.Notifications", "NotificationClosed"))) {
+		dbus_message_append_args(m, DBUS_TYPE_UINT32, &id, DBUS_TYPE_UINT32, &reason, DBUS_TYPE_INVALID);
+		dbus_connection_send(bus, m, NULL);
+		dbus_message_unref(m);
+	}
+}
+
+static unsigned int
+notify(const char *app, unsigned int replaces, const char *summary, const char *body, int timeout)
+{
+	XSetWindowAttributes wa;
+	Notif *n, **pn;
+	char buf[1024], word[256], *p, *w;
+	int i, len;
+
+	for (n = notifs; n && (!replaces || n->id != replaces); n = n->next);
+	if (!n) {
+		if (!(n = calloc(1, sizeof *n)))
+			return 0;
+		n->id = ++lastid;
+		wa.override_redirect = True;
+		wa.background_pixel = col[ColBg].pixel;
+		wa.event_mask = ExposureMask|ButtonPressMask;
+		n->win = XCreateWindow(dpy, root, 0, 0, 1, 1, 0, CopyFromParent, CopyFromParent, CopyFromParent,
+		                       CWOverrideRedirect|CWBackPixel|CWEventMask, &wa);
+		n->draw = XftDrawCreate(dpy, n->win, DefaultVisual(dpy, DefaultScreen(dpy)),
+		                        DefaultColormap(dpy, DefaultScreen(dpy)));
+		for (pn = &notifs; *pn; pn = &(*pn)->next);
+		*pn = n;
+		XMapRaised(dpy, n->win);
+	}
+	ucut(n->app, *app ? app : "notification", NOTIFCOLS - 10, sizeof n->app);
+	plain(buf, summary, sizeof buf);
+	ucut(n->line[0], buf, NOTIFCOLS - 4, sizeof n->line[0]);
+	n->nlines = 1;
+
+	/* the body, a word at a time, in up to 3 lines under the summary */
+	plain(buf, body, sizeof buf);
+	for (p = buf; (w = strsep(&p, " "));) {
+		if (!*w)
+			continue;
+		ucut(word, w, NOTIFCOLS - 4, sizeof word);
+		i = n->nlines - 1;
+		if (i > 0 && ulen(n->line[i]) + 1 + ulen(word) <= NOTIFCOLS - 4) {
+			len = strlen(n->line[i]);
+			snprintf(n->line[i] + len, sizeof n->line[i] - len, " %s", word);
+		} else if (n->nlines < 4)
+			snprintf(n->line[n->nlines++], sizeof n->line[0], "%s", word);
+		else
+			break;
+	}
+	n->w = 0;
+	for (i = 0; i < n->nlines; i++)
+		n->w = MAX(n->w, ulen(n->line[i]) + 4);
+	n->w = MAX(n->w, ulen(n->app) + 10) * cw;
+	n->h = (n->nlines + 2) * ch;
+	/* -1: the usual 5 seconds. 0: until it's clicked */
+	n->until = timeout == 0 ? 0 : time(NULL) + (timeout < 0 ? 5 : (timeout + 999) / 1000);
+	placenotifs();
+	return n->id;
+}
+
+static void
+expirenotifs(void)
+{
+	Notif *n, *next;
+	time_t now = time(NULL);
+
+	for (n = notifs; n; n = next) {
+		next = n->next;
+		if (n->until && n->until <= now)
+			closenotif(n, 1);
+	}
+}
+
+static Notif *
+wintonotif(Window w)
+{
+	Notif *n;
+
+	for (n = notifs; n && n->win != w; n = n->next);
+	return n;
+}
+
+static void
+arg(DBusMessageIter *it, int type, void *v)
+{
+	if (dbus_message_iter_get_arg_type(it) == type)
+		dbus_message_iter_get_basic(it, v);
+	dbus_message_iter_next(it);
+}
+
+static void
+dbusmessage(DBusMessage *m)
+{
+	static const char *iface = "org.freedesktop.Notifications";
+	static const char *caps[] = { "body" }, **cp = caps;
+	static const char *info[] = { "ttywm", "Chamesle", VERSION, "1.2" };
+	const char *app = "", *icon = "", *summary = "", *body = "";
+	dbus_uint32_t replaces = 0, id;
+	dbus_int32_t timeout = -1;
+	DBusMessageIter it;
+	DBusMessage *r;
+	Notif *n;
+
+	if (dbus_message_get_type(m) != DBUS_MESSAGE_TYPE_METHOD_CALL)
+		return;
+	if (dbus_message_is_method_call(m, iface, "Notify")) {
+		dbus_message_iter_init(m, &it);
+		arg(&it, DBUS_TYPE_STRING, &app);
+		arg(&it, DBUS_TYPE_UINT32, &replaces);
+		arg(&it, DBUS_TYPE_STRING, &icon);
+		arg(&it, DBUS_TYPE_STRING, &summary);
+		arg(&it, DBUS_TYPE_STRING, &body);
+		dbus_message_iter_next(&it);	/* actions: not here */
+		dbus_message_iter_next(&it);	/* hints */
+		arg(&it, DBUS_TYPE_INT32, &timeout);
+		id = notify(app, replaces, summary, body, timeout);
+		r = dbus_message_new_method_return(m);
+		dbus_message_append_args(r, DBUS_TYPE_UINT32, &id, DBUS_TYPE_INVALID);
+	} else if (dbus_message_is_method_call(m, iface, "CloseNotification")) {
+		dbus_message_iter_init(m, &it);
+		id = 0;
+		arg(&it, DBUS_TYPE_UINT32, &id);
+		for (n = notifs; n && n->id != id; n = n->next);
+		if (n)
+			closenotif(n, 3);
+		r = dbus_message_new_method_return(m);
+	} else if (dbus_message_is_method_call(m, iface, "GetCapabilities")) {
+		r = dbus_message_new_method_return(m);
+		dbus_message_append_args(r, DBUS_TYPE_ARRAY, DBUS_TYPE_STRING, &cp, 1, DBUS_TYPE_INVALID);
+	} else if (dbus_message_is_method_call(m, iface, "GetServerInformation")) {
+		r = dbus_message_new_method_return(m);
+		dbus_message_append_args(r, DBUS_TYPE_STRING, &info[0], DBUS_TYPE_STRING, &info[1],
+		                         DBUS_TYPE_STRING, &info[2], DBUS_TYPE_STRING, &info[3], DBUS_TYPE_INVALID);
+	} else
+		r = dbus_message_new_error(m, DBUS_ERROR_UNKNOWN_METHOD, "ttywm only shows notifications");
+	if (r) {
+		dbus_connection_send(bus, r, NULL);
+		dbus_message_unref(r);
+	}
+}
+
+/* no session bus, or another program shows notifications already (like dunst): then not us */
+static void
+setupbus(void)
+{
+	DBusError err;
+
+	dbus_error_init(&err);
+	if (!(bus = dbus_bus_get(DBUS_BUS_SESSION, &err))) {
+		dbus_error_free(&err);
+		return;
+	}
+	dbus_connection_set_exit_on_disconnect(bus, FALSE);
+	if (dbus_bus_request_name(bus, "org.freedesktop.Notifications", DBUS_NAME_FLAG_DO_NOT_QUEUE, &err)
+	    != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) {
+		dbus_error_free(&err);
+		bus = NULL;
+	}
+}
+
+static void
+readbus(void)
+{
+	DBusMessage *m;
+
+	if (!bus)
+		return;
+	dbus_connection_read_write(bus, 0);
+	while ((m = dbus_connection_pop_message(bus))) {
+		dbusmessage(m);
+		dbus_message_unref(m);
+	}
+	dbus_connection_flush(bus);
 }
 
 /* ---- windows ---- */
@@ -889,6 +1261,38 @@ setfullscreen(Client *c, int full)
 	XRaiseWindow(dpy, c->frame);
 }
 
+/* super+arrows: half the screen, all of it, or back where it was */
+static void
+snap(Client *c, int how)
+{
+	int cols = sw / cw, rows = wh / ch, half = cols / 2;
+
+	if (c->isfull)
+		return;
+	if (how == ActRestore) {
+		if (c->snapped) {
+			move(c, c->sx, c->sy);
+			resize(c, c->sw, c->sh);
+		}
+		c->snapped = 0;
+		return;
+	}
+	if (!c->snapped) {
+		c->sx = c->x; c->sy = c->y; c->sw = c->w; c->sh = c->h;
+		c->snapped = 1;
+	}
+	if (how == ActLeft) {
+		move(c, 0, 0);
+		resize(c, (half - 2) * cw, (rows - 2) * ch);
+	} else if (how == ActRight) {
+		move(c, half * cw, 0);
+		resize(c, (cols - half - 2) * cw, (rows - 2) * ch);
+	} else {
+		move(c, 0, 0);
+		resize(c, (cols - 2) * cw, (rows - 2) * ch);
+	}
+}
+
 static void
 mousedrag(Client *c, int resizing)
 {
@@ -917,6 +1321,104 @@ mousedrag(Client *c, int resizing)
 			move(c, ox + (ev.xmotion.x_root - px) / cw * cw, oy + (ev.xmotion.y_root - py) / ch * ch);
 	} while (ev.type != ButtonRelease);
 	XUngrabPointer(dpy, CurrentTime);
+}
+
+/* ---- the lock screen: a login prompt, checked by pam like a real one ---- */
+
+static int
+conv(int n, const struct pam_message **msg, struct pam_response **resp, void *pw)
+{
+	int i;
+
+	if (!(*resp = calloc(n, sizeof **resp)))
+		return PAM_BUF_ERR;
+	for (i = 0; i < n; i++)
+		if (msg[i]->msg_style == PAM_PROMPT_ECHO_OFF || msg[i]->msg_style == PAM_PROMPT_ECHO_ON)
+			(*resp)[i].resp = strdup(pw);
+	return PAM_SUCCESS;
+}
+
+static int
+checkpassword(const char *user, const char *pw)
+{
+	struct pam_conv pc = { conv, (void *)pw };
+	pam_handle_t *ph;
+	int r;
+
+	if (pam_start("system-local-login", user, &pc, &ph) != PAM_SUCCESS)
+		return 0;
+	r = pam_authenticate(ph, 0);
+	pam_end(ph, r);
+	return r == PAM_SUCCESS;
+}
+
+static void
+lock(void)
+{
+	XSetWindowAttributes wa;
+	XftDraw *d;
+	XEvent ev;
+	KeySym sym;
+	char host[64] = "", line[256], buf[8], pw[256] = "", *user = getenv("USER");
+	int n = 0, wrong = 0, i, len;
+	Window w;
+
+	gethostname(host, sizeof host);
+	wa.override_redirect = True;
+	wa.background_pixel = col[ColBg].pixel;
+	wa.event_mask = ExposureMask|KeyPressMask;
+	w = XCreateWindow(dpy, root, 0, 0, sw, sh, 0, CopyFromParent, CopyFromParent, CopyFromParent,
+	                         CWOverrideRedirect|CWBackPixel|CWEventMask, &wa);
+	d = XftDrawCreate(dpy, w, DefaultVisual(dpy, DefaultScreen(dpy)), DefaultColormap(dpy, DefaultScreen(dpy)));
+	XMapRaised(dpy, w);
+	/* the keyboard can be busy for a moment, like when the key that locked is still down */
+	for (i = 0; i < 100; i++) {
+		if (XGrabKeyboard(dpy, w, True, GrabModeAsync, GrabModeAsync, CurrentTime) == GrabSuccess)
+			break;
+		usleep(10000);
+	}
+	XGrabPointer(dpy, w, False, 0, GrabModeAsync, GrabModeAsync, w, None, CurrentTime);
+	for (;;) {
+		XftDrawRect(d, &col[ColBg], 0, 0, sw, sh);
+		snprintf(line, sizeof line, "Chamesle Linux (tty%d)", cur + 1);
+		text(d, ColBar, 0, 0, line);
+		snprintf(line, sizeof line, "%s login: %s", host, user ? user : "");
+		text(d, ColBar, 0, 2 * ch, line);
+		text(d, ColBar, 0, 3 * ch, "Password: ");
+		if (wrong)
+			text(d, ColBar, 0, 5 * ch, "Login incorrect");
+		XRaiseWindow(dpy, w);
+		XNextEvent(dpy, &ev);
+		if (ev.type == Expose || ev.xany.window != w) {
+			/* the rest of the world goes on underneath */
+			if (ev.xany.window != w && handler[ev.type] && ev.type != KeyPress && ev.type != ButtonPress)
+				handler[ev.type](&ev);
+			continue;
+		}
+		if (ev.type != KeyPress)
+			continue;
+		len = XLookupString(&ev.xkey, buf, sizeof buf, &sym, NULL);
+		if (sym == XK_Return || sym == XK_KP_Enter) {
+			pw[n] = '\0';
+			if (user && checkpassword(user, pw))
+				break;
+			wrong = 1;
+			n = 0;
+		} else if (sym == XK_BackSpace && n)
+			n--;
+		else if (sym == XK_Escape)
+			n = 0;
+		else if (len > 0 && !iscntrl((unsigned char)buf[0]) && n + len < (int)sizeof pw - 1) {
+			memcpy(pw + n, buf, len);
+			n += len;
+		}
+	}
+	memset(pw, 0, sizeof pw);
+	XUngrabPointer(dpy, CurrentTime);
+	XUngrabKeyboard(dpy, CurrentTime);
+	XftDrawDestroy(d);
+	XDestroyWindow(dpy, w);
+	focus(sel);
 }
 
 /* ---- what keys and clicks do ---- */
@@ -984,6 +1486,13 @@ doaction(Key *k)
 	case ActVolUp:    setvolume("5%+"); break;
 	case ActVolDown:  setvolume("5%-"); break;
 	case ActMute:     setvolume("mute"); break;
+	case ActLightUp:  setlight(5); drawbar(); break;
+	case ActLightDown: setlight(-5); drawbar(); break;
+	case ActLeft: case ActRight: case ActMax: case ActRestore:
+		if (sel)
+			snap(sel, k->act);
+		break;
+	case ActLock:     lock(); break;
 	}
 }
 
@@ -1003,6 +1512,9 @@ barclick(XButtonPressedEvent *ev)
 				setvolume("5%-");
 			else if (ev->button == Button1)
 				setvolume("mute");
+		} else if (segs[i].seg == SegLight && (ev->button == Button4 || ev->button == Button5)) {
+			setlight(ev->button == Button4 ? 5 : -5);
+			drawbar();
 		} else if (segs[i].seg == SegNet && ev->button == Button1) {
 			snprintf(cmd, sizeof cmd, "exec %s -T network -e nmtui", SHELLCMD);
 			run(cmd);
@@ -1017,10 +1529,15 @@ buttonpress(XEvent *e)
 {
 	XButtonPressedEvent *ev = &e->xbutton;
 	Client *c;
+	Notif *n;
 	int cols;
 
 	if (ev->window == bar) {
 		barclick(ev);
+		return;
+	}
+	if ((n = wintonotif(ev->window))) {
+		closenotif(n, 2);
 		return;
 	}
 	if (!(c = wintoclient(ev->window))) {
@@ -1109,6 +1626,8 @@ expose(XEvent *e)
 		return;
 	if (e->xexpose.window == bar)
 		drawbar();
+	else if (wintonotif(e->xexpose.window))
+		drawnotif(wintonotif(e->xexpose.window));
 	else if ((c = wintoclient(e->xexpose.window)))
 		drawframe(c);
 }
@@ -1182,6 +1701,7 @@ tick(void)
 
 	if (now == last)
 		return;
+	expirenotifs();
 	if (stat(cfgpath, &st) == 0 && st.st_mtime != cfgmtime) {
 		loadconfig(0);
 		grabkeys();
@@ -1259,6 +1779,8 @@ setup(void)
 	XSelectInput(dpy, root, SubstructureRedirectMask|SubstructureNotifyMask);
 	grabkeys();
 	readvolume();
+	findbacklight();
+	setupbus();
 }
 
 int
@@ -1267,7 +1789,7 @@ main(int argc, char *argv[])
 	XEvent ev;
 	fd_set fds;
 	struct timeval tv;
-	int fd;
+	int fd, bfd = -1;
 
 	if (argc == 2 && !strcmp("-v", argv[1]))
 		die("ttywm-" VERSION);
@@ -1290,17 +1812,22 @@ main(int argc, char *argv[])
 	spawnshell(cur);
 	drawbar();
 
-	/* events, and a tick every second for the bottom line */
+	/* events, notifications, and a tick every second for the bottom line */
 	fd = ConnectionNumber(dpy);
+	if (bus)
+		dbus_connection_get_unix_fd(bus, &bfd);
 	while (running) {
 		if (!XPending(dpy)) {
 			FD_ZERO(&fds);
 			FD_SET(fd, &fds);
+			if (bfd >= 0)
+				FD_SET(bfd, &fds);
 			tv.tv_sec = 1;
 			tv.tv_usec = 0;
-			if (select(fd + 1, &fds, NULL, NULL, &tv) < 0 && errno != EINTR)
+			if (select(MAX(fd, bfd) + 1, &fds, NULL, NULL, &tv) < 0 && errno != EINTR)
 				break;
 		}
+		readbus();
 		while (running && XPending(dpy)) {
 			XNextEvent(dpy, &ev);
 			if (handler[ev.type])

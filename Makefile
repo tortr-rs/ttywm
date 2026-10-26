@@ -1,10 +1,10 @@
 # ttywm
-VERSION = 0.4
+VERSION = 0.5
 PREFIX = /usr/local
 
-PKGS = x11 xft fontconfig
+PKGS = x11 xft fontconfig dbus-1
 CFLAGS += -std=c99 -pedantic -Wall -Os -D_DEFAULT_SOURCE -DVERSION=\"$(VERSION)\" `pkg-config --cflags $(PKGS)`
-LDLIBS += `pkg-config --libs $(PKGS)`
+LDLIBS += `pkg-config --libs $(PKGS)` -lpam
 
 ttywm: ttywm.c
 	$(CC) $(CFLAGS) -o $@ ttywm.c $(LDFLAGS) $(LDLIBS)

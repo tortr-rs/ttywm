@@ -14,7 +14,7 @@ The bottom line shows the network, volume, battery, date, time and which tty
 you're on. Click the volume to mute, scroll on it to change it, click the
 network to set up wifi.
 
-X11 only, one C file, needs libX11, libXft, xterm, and rofi for the apps menu.
+X11 only, one C file, needs libX11, libXft, libdbus, pam, xterm, and rofi for the apps menu.
 
 Install
 -------
@@ -50,12 +50,23 @@ Keys
 	Super+1..9          go to tty1..tty9
 	Super+Shift+1..9    send window to that tty
 	Super+Shift+e       log out
+	Super+Left/Right    half the screen
+	Super+Up            all of it
+	Super+Down          back where it was
+	Super+l             lock the screen
 	Super+drag          move
 	Super+right drag    resize
 	volume keys         volume
+	brightness keys     brightness
 
 Click [x] to close, drag the title to move, drag the bottom right corner to
 resize, click the shell to type in it. Exit the shell and you get a new one.
+
+Notifications show up in the top right corner, in a frame like the windows.
+Click one to close it. If another program already shows notifications, like
+dunst, ttywm leaves them to it.
+
+The lock screen is a login prompt. Your password unlocks it.
 
 fbttywm
 -------
