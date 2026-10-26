@@ -1,4 +1,4 @@
-ttywm - a window manager that looks like a tty
+ttywm ,a window manager that looks like a tty
 ==============================================
 
 ![ttywm](screenshot.png)
