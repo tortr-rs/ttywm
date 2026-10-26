@@ -1,0 +1,29 @@
+# ttywm
+VERSION = 0.4
+PREFIX = /usr/local
+
+PKGS = x11 xft fontconfig
+CFLAGS += -std=c99 -pedantic -Wall -Os -D_DEFAULT_SOURCE -DVERSION=\"$(VERSION)\" `pkg-config --cflags $(PKGS)`
+LDLIBS += `pkg-config --libs $(PKGS)`
+
+ttywm: ttywm.c
+	$(CC) $(CFLAGS) -o $@ ttywm.c $(LDFLAGS) $(LDLIBS)
+
+install: ttywm
+	@[ -n "$(DESTDIR)" ] || command -v xterm >/dev/null || { echo "ttywm needs xterm: install it first"; exit 1; }
+	mkdir -p $(DESTDIR)$(PREFIX)/bin
+	install -m 755 ttywm ttywm-term ttywm-session $(DESTDIR)$(PREFIX)/bin/
+	mkdir -p $(DESTDIR)/usr/share/fonts/ttywm
+	install -m 644 vga.ttf $(DESTDIR)/usr/share/fonts/ttywm/
+	-fc-cache -f $(DESTDIR)/usr/share/fonts/ttywm
+	mkdir -p $(DESTDIR)/usr/share/xsessions
+	sed 's|@PREFIX@|$(PREFIX)|' ttywm.desktop > $(DESTDIR)/usr/share/xsessions/ttywm.desktop
+
+uninstall:
+	rm -rf $(DESTDIR)$(PREFIX)/bin/ttywm $(DESTDIR)$(PREFIX)/bin/ttywm-term $(DESTDIR)$(PREFIX)/bin/ttywm-session $(DESTDIR)/usr/share/fonts/ttywm \
+	      $(DESTDIR)/usr/share/xsessions/ttywm.desktop
+
+clean:
+	rm -f ttywm
+
+.PHONY: install uninstall clean

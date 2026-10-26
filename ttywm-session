@@ -1,0 +1,5 @@
+#!/bin/sh
+# what the login screen runs: a session bus, sound, then ttywm
+[ -n "$DBUS_SESSION_BUS_ADDRESS" ] || exec dbus-run-session "$0" "$@"
+pgrep -u "$(id -u)" -x pipewire >/dev/null || pipewire &
+exec ttywm

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=ttywm
+Comment=floating window manager that looks like a tty
+Exec=@PREFIX@/bin/ttywm-session
+DesktopNames=ttywm
+Type=Application

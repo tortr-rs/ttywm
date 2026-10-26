@@ -1,0 +1,15 @@
+#!/bin/sh
+# xterm dressed as the linux console: VGA font, its 16 colours, blinking underline cursor
+command -v xterm >/dev/null || { echo "ttywm-term: xterm is not installed" >&2; exit 1; }
+exec xterm -fa "VGA:pixelsize=${TTYWM_SIZE:-16}:antialias=false:hinting=false" \
+	-bg '#000000' -fg '#aaaaaa' -cr '#aaaaaa' -uc -bc -b 0 -bw 0 +sb \
+	-xrm '*color0: #000000'  -xrm '*color8: #555555' \
+	-xrm '*color1: #aa0000'  -xrm '*color9: #ff5555' \
+	-xrm '*color2: #00aa00'  -xrm '*color10: #55ff55' \
+	-xrm '*color3: #aa5500'  -xrm '*color11: #ffff55' \
+	-xrm '*color4: #0000aa'  -xrm '*color12: #5555ff' \
+	-xrm '*color5: #aa00aa'  -xrm '*color13: #ff55ff' \
+	-xrm '*color6: #00aaaa'  -xrm '*color14: #55ffff' \
+	-xrm '*color7: #aaaaaa'  -xrm '*color15: #ffffff' \
+	-xrm '*allowBoldFonts: false' -xrm '*boldMode: false' -xrm '*boldColors: true' -xrm '*cursorBlink: true' \
+	-xrm '*metaSendsEscape: true' "$@"
